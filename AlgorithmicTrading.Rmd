@@ -1,0 +1,675 @@
+---
+output: word_document
+title: "Algorithmic Trading"
+author:
+  - Calvin Hew
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r Libraries, include=FALSE}
+# Check for and install missing packages
+if (!requireNamespace("neuralnet", quietly = TRUE)) {
+  install.packages('neuralnet')
+}
+if (!requireNamespace("devtools", quietly = TRUE)) {
+  install.packages("devtools")
+}
+
+if (!requireNamespace("blotter", quietly = TRUE)) {
+  install_github("braverock/blotter")
+}
+if (!requireNamespace("quantstrat", quietly = TRUE)) {
+  install_github("braverock/quantstrat")
+}
+if (!requireNamespace("ggplot2", quietly = TRUE)) {
+  install.packages("ggplot2")
+}
+
+library(neuralnet)
+library(devtools)
+library(blotter)
+library(quantstrat)
+library(ggplot2)
+```
+
+# Background
+The use of Algorithmic Trading. (AT) as a tool for automating the process of trading stocks remains dominant since it was first utilised over two decade ago. The main appeal of algorithmic trading is the ability to trade stocks reliably without human intervention (Chaboud et. al., 2014). The key factor being **reliable** as systems have only become more sophisticated with the advances in AI techniques (Pothumsetty, 2020). Moreover, a major argument for using AT is the benefit of eliminating human biases, which typically hinders trading decisions (Das and Kadapakkam). As a result, the aim for this project is to propose algorithmic trading system that can reliably make decisions to gain a profit.
+
+## Existing Systems
+The notable success of Neural Networks (NN) predictions when used with time-series data (Fan et. al., 2024) suggests that it may perform well when presented with trading data. This is confirmed by Evans et. al. (2013) who proposed a strategy implementing a NN with a Genetic Algorithm (GA) which achieved an impressive 23.3% for annualised net profit. 
+
+## Trading Indicators
+Equally important to forecasting prices is the consideration of indicators as part of the process of formulating trading rules. A popular indicator is the MACD (Moving Average Convergence/Divergence indicator) which utilises the relationship between 2 moving averages (MACD + signal lines) to identify changes in momentum (Dolan, 2024). There are a number of prominent MACD trading strategies with the most popular being: the Crossover Strategy and the Zero-Cross Strategy (Schlossberg, 2024). As implied, the Crossover strategy looks at the intersection between the signal and MACD lines - generating either a bullish signal (for buying) or bearish signal (for selling). The Zero-cross sends a bullish signal whenever it inspects the crossover of the MACD line from below the zero line to above.
+
+## Approach
+The technique proposed in this study is one of price prediction-based trading. Justified by the previous discussions, this project will implement a NN for forecasting prices. Based on these predictions, the MACD indicator and trading rules, the Zero-Cross strategy will be implemented. The proposed system and strategy will automate the decision process of entering or exiting a market for a particular stock. Finally, its performance will be evaluated against a competing strategy based on filter rules.
+
+# Data
+
+```{r assets, echo=TRUE}
+
+set.seed(100)
+
+asset <- "LLY"
+data <- getSymbols(Symbols = asset, src = "yahoo", from = "2021-01-01", 
+                   to = "2022-01-01", period = "daily")
+```
+
+The stock of Eli Lilly and Company (LLY) demonstrated a consistent upward trajectory in the year 2021, reflective of robust financial outcomes and favorable investor confidence. Such a trend renders LLY a suitable candidate for the empirical assessment of trading strategies, thereby providing a substantial case for evaluating the robustness of forecasting algorithms amidst its steady market ascent. 
+
+```{r convert data to df, include=FALSE}
+data_xts <- xts(LLY, order.by = index(LLY))
+
+price_df<- data.frame(date=index(LLY), coredata(LLY))
+price_close <- price_df$LLY.Close
+price_open <- price_df$LLY.Open
+
+price_df
+```
+
+A plot of this asset's open and close prices shows the overall rise over the trading period:
+
+```{r, fig.width=8, fig.height=4, echo=FALSE}
+ggplot(price_df, aes(x = date)) +
+  geom_line(aes(y = LLY.Open, colour = "Open"), linewidth = 1) +
+  geom_line(aes(y = LLY.Close, colour = "Close"), linewidth = 1) +
+  scale_color_manual("", 
+                     values = c("Open" = "steelblue", "Close" = "darkred")) +
+  labs(title = "Open vs Close Prices for LLY (2021)", y = "Price", x = "") +
+  theme_minimal()
+```
+
+The period of 2021-01-01 to 2021-12-31 was selected as it acts a better indicator of the current and future market trends. Moreover, stable stocks with few price oscillations (such as Google and Microsoft) were avoided as it is not effective in testing the robustness of the Neural Network.
+
+``` {r processing data, include=FALSE}
+processPrices <- function(price_close, price_open, lag, train_size){
+  # lagged data
+  core_prices <- data.frame(coredata(price_close), coredata(price_open))
+  close_lagged <- Lag(price_close,k=lag)
+  open_lagged <- Lag(price_open,k=lag)
+  
+  colnames(core_prices) <- c("close", "open")
+  colnames(close_lagged) <- paste0("c", 1:3)
+  colnames(open_lagged) <- paste0("o", 1:3)
+  
+  # combine dfs
+  prices_lagged <- cbind(core_prices, close_lagged, open_lagged)
+
+  # remove NaNs
+  prices_lagged <- prices_lagged[complete.cases(prices_lagged),]
+  
+  # scaled data
+  prices_scaled <- scale(prices_lagged)
+  
+  # used to rescale later
+  scale_parameters <- attributes(prices_scaled)[3:4]
+  
+  scaled_train <- as.ts(prices_scaled[1:train_size,])
+  scaled_test <- as.ts(prices_scaled[(train_size + 1):nrow(prices_scaled),])
+  
+  return (list(scaled_train, scaled_test, scale_parameters))
+}
+```
+
+Processing data involves lagging and scaling the data. A lag of 3 is applied - which is important for a price-prediction approach as it can help to capture trends and dependencies within the data which are valuable for detecting future patterns. NaN values also needs to be addressed before feeding to the NN.
+
+```{r lag}
+lag = c(1:3)
+```
+
+# Trading Strategy
+
+## Neural Network
+
+The neural network (NN) will be utilized to forecast the opening and closing prices of selected assets. The accuracy of the NN's predictions will be measured using the common evaluation metric of Root Mean Squared Error (RMSE).
+
+```{r neural network train function, include=TRUE}
+train_nn <- function(train_data) {
+  col_name <- colnames(train_data)
+  core_cols <- col_name[1:2]
+  
+  
+  f <- as.formula(paste("close + open ~", paste(col_name[!col_name %in% core_cols],
+                                                collapse = " + ")))
+  hidden_layers <- c(8,5,2)
+  threshold <- 0.006
+  
+  set.seed(100)
+  nn <- neuralnet(f, data=train_data,  hidden=hidden_layers, 
+                  threshold = threshold, stepmax=1e6)
+  
+  return(nn)
+}
+```
+
+The NN predicts both Open and Close prices for the selected asset. There are arguments justifying either approach of using Open or Close prices in the context of MACD trading strategies. Closed is typically favoured for minimising risks as it better reflects trade activity. Open gives insight to potential early trends but suffers from more volatility.
+
+The formula parameter when expressed in full is: f = close + open ~ c1 +c2 +c3 + o1 +o2 +o3 which allows the network to separately predict both open and close prices.
+
+```{r neural network predictions, fig.width=7, fig.height=3, include=FALSE}
+### prediction of closing/opening prices
+predict_nn <- function(nn, train_data, test_data, scale_params) {
+  train_predictions <- compute(nn, train_data)
+  test_predictions <- compute(nn, test_data)
+  
+  ## results 
+  train_results <- train_predictions$net.result
+  test_results <- test_predictions$net.result
+  
+  # plot predicted test for open and close prices
+  plot(test_data[,1], lwd=4, col=1, main="Close Prices", ylim=c(-3,3), ylab="Price", panel.first = grid())
+  lines(test_results[,1],lwd = 2.5, col=2)
+  legend("bottomleft", c("Actual Close", "Predicted Close"), cex=1.0, fill=1:4)
+  
+  plot(test_data[,2], lwd=4, col=1, main="Open Prices", ylim=c(-3,3), ylab="Price", panel.first = grid())
+  lines(test_results[,2],lwd = 2.5, col=2)
+  legend("bottomleft", c("Actual Open", "Predicted Open"), cex=1.0, fill=1:4)
+  
+  # evaluate predictions
+  RMSE_close_train <- sqrt(mean((train_results[,1] - train_data[,1])^2))
+  print(paste0("RMSE Close Price (Train): ", RMSE_close_train))
+  RMSE_close_test <- sqrt(mean((test_results[,1] - test_data[,1])^2))
+  print(paste0("RMSE Close Price (Test): ", RMSE_close_test))
+  
+  RMSE_open_train <- sqrt(mean((train_results[,2] - train_data[,2])^2))
+  print(paste0("RMSE Open Price (Train): ", RMSE_open_train))
+  RMSE_open_test <- sqrt(mean((test_results[,2] - test_data[,2])^2))
+  print(paste0("RMSE Open Price (Test): ", RMSE_open_test))
+  
+  # rescaled data
+  r_close_train <- train_results[,1] * scale_params[[2]][1] + scale_params[[1]][1]
+  r_open_train <- train_results[,2] * scale_params[[2]][2] + scale_params[[1]][2]
+  r_close_test<- test_results[,1] * scale_params[[2]][1] + scale_params[[1]][1]
+  r_open_test <- test_results[,2] * scale_params[[2]][2] + scale_params[[1]][2]
+  
+  return(list(r_close_train, r_open_train, r_close_test, r_open_test))
+}
+```
+
+```{r training variable init}
+### training
+train_size <- 200
+price_data <- processPrices(price_close, price_open, lag, train_size)
+train_data <- price_data[[1]]
+test_data <- price_data[[2]]
+```
+
+Though the obvious approach may seem to be investing in the best performing stocks from the previous year, trading experts often argue against this naive strategy (Ermey, 2023). Thus, instead of training over an annualised trading period, a less risky approach justifies using a test-train split. A train size of 200 is used to ensure there is enough test data to be used for back-testing.
+
+To evaluate the performance of the NN predictions, the metric of Root Mean Squared Error (RMSE) can be calculated. The RSME compares the predicted value against the real data for quantifying the error in the NN - therefore a smaller value is more desirable. The results presented show the respective RMSE of train vs. test data for both open and closed prices. Though the predicted test data for close price contains the highest error, values between 0.2 and 0.5 are generally acceptable as accurate predictors in ML contexts. 
+
+```{r neural network train and predict, fig.width=6, fig.height=3,}
+nn = train_nn(train_data)
+### prediction
+scale_params <- price_data[[3]]
+results = predict_nn(nn, train_data, test_data, scale_params)
+```
+
+```{r neural network output, include=FALSE}
+# predicted open/close prices
+r_close_train <- results[[1]]
+r_open_train <- results[[2]]
+r_close_test <- results[[3]]
+r_open_test <- results[[4]]
+
+total_rows <- nrow(train_data)+nrow(test_data)
+```
+
+## Trading Rules
+
+The `macdTrading` function serves as an automated trading system with a $10,000 starting fund, trading with the "LLY" stock and using the MACD Zero-line cross strategy. Based on the NN's predicted prices, it scans for when the MACD line crosses above the zero line, indicating an uptrend and a cue to buy 100 units of stock, and identifies crosses below the zero line as downtrends, signaling to sell and secure positions.
+
+Typically the MACD parameters are 12-26-9 for fast, slow and signal respectively. However, the recommended setting for day trading is suggested to be 3-10-16 (AvaTrade, 2024). This will be used for the proposed approach as short term trading is more conducive of the limited data with a train/test split. 
+
+```{r strategy, include=FALSE}
+
+init_macd_strategy <- function(prices, fast, slow) {
+  strategy.st <- 'macd'
+
+  strategy(strategy.st, store=TRUE)
+  
+  # add MACD indicator to trading strategy utilising predicted closing prices
+  add.indicator(strategy.st, name = "MACD", 
+                arguments = list(x=prices,
+                                 nFast=fast, 
+                                 nSlow=slow),
+                label='macd' 
+  )
+  
+  # greater than 0 trading signals for MACD - aka bullish signal
+  add.signal(strategy.st,name="sigThreshold",
+             arguments = list(column="signal.macd",
+                              relationship="gt",
+                              threshold=0,
+                              cross=TRUE),
+             label="signal.bullish"
+  )
+  
+  # less than 0 trading signals for MACD - aka bearish signal
+  add.signal(strategy.st,name="sigThreshold",
+             arguments = list(column="signal.macd",
+                              relationship="lt",
+                              threshold=0,
+                              cross=TRUE),
+             label="signal.bearish"
+  )
+  
+  # rule for entry
+  add.rule(strategy.st,name='ruleSignal', 
+           arguments = list(sigcol="signal.bullish",
+                            sigval=TRUE, 
+                            orderqty=100, 
+                            ordertype='market', 
+                            orderside='long'),
+           type='enter',
+           label='enter',
+           storefun=FALSE
+  )
+  
+  # rule for exit
+  add.rule(strategy.st,name='ruleSignal', 
+           arguments = list(sigcol="signal.bearish",
+                            sigval=TRUE, 
+                            orderqty='all', 
+                            ordertype='market', 
+                            orderside='long'),
+           type='exit',
+           label='exit'
+  )
+  
+  return(strategy.st)
+}
+
+```
+
+```{r macd trading rule, include=TRUE}
+macdTrading <- function(asset, prices) {
+  # reset strategy
+  rm.strat(name = 'macd', silent = TRUE)
+  
+  # initial funds
+  init_eq = 10000
+  currency('USD')
+  stock(asset,currency='USD',multiplier=1)
+  portfolio.st <- 'macd'
+  account.st <- 'macd'
+  
+  # initialise portfolio, account and orders
+  initPortf(name=portfolio.st,
+            symbols=asset)
+  initAcct(name=account.st,
+           portfolios=portfolio.st,
+           initEq=init_eq)
+  initOrders(portfolio=portfolio.st)
+  
+  strat <- init_macd_strategy(prices, 3, 10)
+  
+  out<-try(applyStrategy(strat, portfolio.st, parameters=list(nFast=3, nSlow=10, nSig=16, maType="EMA"), verbose=TRUE))
+  updatePortf(Portfolio=portfolio.st)
+  
+  return(portfolio.st)
+}
+```
+
+The zero-line cross strategy offers significant advantages by leveraging precise timing for market entries and exits, aiming to amplify the initial investment through astute predictions of price movements. Its design emphasizes efficiency and simplicity, automating trading decisions to focus on profitability and risk management. 
+
+In the proposed system, a bullish signal is generated if the MACD is identified to cross the zero line from below whilst a bearish signal is provided if the zero line is crossed from above. This can be achieved through the use of the `quantstrat` package.
+
+The trading rules then dictate a stock to be purchased in the case of bullish signals and sold under bearish signals. Finally, performance of the trading strategy can be evaluated by plotting the trading positions and analysing the trading statistics (such as Net P/L) using `tstats <- tradeStats(portfolio)`.
+
+This approach not only simplifies the trading process but also ensures that every decision is data-driven and aligned with overarching investment goals, all within a framework that meticulously tracks and evaluates the strategy's performance over time.
+
+The alternative crossover strategy offers the advantage of capturing significant trends, potentially leading to profitable trades when these stocks begin a new trend. However, the inherent drawback is the lagging signals that might result in entering or exiting trades later than optimal. For "LLY", this could mean missing the initial movements of a promising trend or holding onto a position too long when the trend reverses, affecting the overall profitability and risk management of your trading strategy.
+
+Thus, the proposed strategy offers a systematic approach to trading by leveraging the MACD indicator to automate the identification of potential buy and sell signals in predicted price data. While such strategies hold promise for investors seeking to capitalize on market trends, it's crucial to recognize the inherent risks involved in trading and to conduct thorough testing and evaluation before deploying strategies in live trading environments.
+
+```{r close prices train data, include=FALSE}
+train_dates <- price_df$date[4:(train_size+3)]
+close_train <- data.frame(train_dates, r_close_train)
+close_train_xts <- xts(close_train[,-1], order.by=close_train[,1])
+
+train_close_prices <- c(Cl(data_xts)[1:3], close_train_xts, Cl(data_xts)[(nrow(close_train_xts)+4):nrow(price_df)])
+
+```
+
+```{r open prices train data, include=FALSE}
+train_dates <- price_df$date[4:(train_size+3)]
+open_train <- data.frame(train_dates, r_open_train)
+open_train_xts <- xts(open_train[,-1], order.by=open_train[,1])
+
+train_open_prices <- c(Op(data_xts)[1:3], open_train_xts, Op(data_xts)[(nrow(open_train_xts)+4):nrow(price_df)])
+
+```
+
+# Performance on Training Data
+
+Initially, the trading strategy's performance should be evaluated in the context of close and open prices. 
+
+```{r macd train data op price, include=FALSE}
+train_macd_open <- macdTrading(asset, quote(train_open_prices))
+```
+
+The `tradeStats()` function provides helpful statistics of the trades conducted with the MACD strategy for both open and close prices. The main metric of interest, undoubtedly, is the net profit/loss. However, it can be helpful to analyse the range of statistics available.
+
+### Open Prices
+
+```{r trading profits train data op price, echo=FALSE}
+tstats_train_macd_op <- tradeStats(Portfolios = train_macd_open)
+macd_netpl_train_op <- round(tstats_train_macd_op$Net.Trading.PL, 2)
+macd_avgpl_train_op <- round(tstats_train_macd_op$Avg.Trade.PL, 2)
+macd_txns_train_op <- tstats_train_macd_op$Num.Txns
+macd_lwin_train_op <- round(tstats_train_macd_op$Largest.Winner, 2)
+
+print(paste0("Net Profit from MACD (Train Op Price): $", macd_netpl_train_op))
+print(paste0("Avg Profit from MACD (Train Op Price): $", macd_avgpl_train_op))
+print(paste0("No. of transactions from MACD (Train Op Price): ", macd_txns_train_op))
+print(paste0("Largest Winner from MACD (Train Op Price): $", macd_lwin_train_op))
+```
+
+```{r macd train data cl price, include=FALSE}
+train_macd_close <- macdTrading(asset, quote(train_close_prices))
+```
+
+### Close Prices
+
+```{r trading profits train data cl price, echo=FALSE}
+tstats_train_macd <- tradeStats(Portfolios = train_macd_close)
+macd_netpl_train <- round(tstats_train_macd$Net.Trading.PL, 2)
+macd_avgpl_train <- round(tstats_train_macd$Avg.Trade.PL, 2)
+macd_txns_train <- tstats_train_macd$Num.Txns
+macd_lwin_train <- round(tstats_train_macd$Largest.Winner, 2)
+
+print(paste0("Net Profit from MACD (Train Cl Price): $", macd_netpl_train))
+print(paste0("Avg Profit from MACD (Train Cl Price): $", macd_avgpl_train))
+print(paste0("No. of transactions from MACD (Train Cl Price): ", macd_txns_train))
+print(paste0("Largest Winner from MACD (Train Cl Price): $", macd_lwin_train))
+
+```
+Comparing the results of the open vs close price, it is unsurprising that the close prices performed better overall. Both conducted 7 transactions in total but close prices ended up with more profit. This reinforces the argument to use close prices with MACD approaches as they are less susceptible to volatile market conditions. Open prices may be considered better for identifying early trends for a more stable asset. However, as LLY has seen some dips and rises throughout the selected trading year, it can explain the comparatively worse performance of open prices. As a result, it is decided that open prices will be dropped moving forward with MACD trading using test data.
+
+## Visualising P and L: Train Data (Cl Prices)
+
+```{r trading statistics train data, echo=FALSE}
+chart.Posn(Portfolio=train_macd_close,
+           Symbol=asset,
+           log=TRUE)
+
+```
+
+
+# Performance on Unseen Data
+
+The approach taken for backtesting is utilising a test-train split over the trading period of 2021-01-01 to 2021-12-31.
+
+```{r close prices test data, include=FALSE}
+# predicted values
+test_index <- nrow(price_df)-length(r_close_test)
+
+test_dates <- price_df$date[(test_index+1):nrow(price_df)]
+close_test <- data.frame(test_dates, r_close_test)
+close_test_xts <- xts(close_test[,-1], order.by=close_test[,1])
+
+test_close_prices <- c(Cl(data_xts)[1:3], close_train_xts, close_test_xts)
+```
+
+## Profits from Trading: Test Data
+
+First, it may be helpful to be recall the evaluation of the NN training: train MSE was 0.098 vs. test MSE was 0.204. That being said, test data is expected to have a higher rate of error in its prediction when compared to the data the model was trained on.
+
+Thus, it is expected that predictions from the test set would result in comparably lesser net profits vs. the train set. However, it may be surprising to learn that this is not the case:
+
+### Profits from Train Set
+```{r print train profits, echo=FALSE}
+print(paste0("Net Profit from MACD (Train): $", macd_netpl_train))
+print(paste0("No. of transactions from MACD (Train): ", macd_txns_train))
+```
+
+```{r macd test, include=FALSE}
+test_macd_close <- macdTrading(asset, quote(test_close_prices))
+```
+
+### Profits from Test Set
+```{r trading profits test data, echo=FALSE}
+tstats_test_macd <- tradeStats(Portfolios = test_macd_close)
+macd_netpl_test <- round(tstats_test_macd$Net.Trading.PL, 2)
+macd_txns_test <- tstats_test_macd$Num.Txns
+
+print(paste0("Net Profit from MACD (Test): $", macd_netpl_test))
+print(paste0("No. of transactions from MACD (Test): ", macd_txns_test))
+```
+
+At first it may seem surprising that the predictions from the test data resulted in a superior profit of \$`r round(macd_netpl_test, 2)`, surpassing the predicted train profits, which stood at \$`r round(macd_netpl_train, 2)`. Despite the perceived inferiority of the test predictions relative to the actual test data, it is conceivable that the forecasted test prices more accurately encapsulate forthcoming market trends.
+
+This can be confirmed through running the MACD strategy against the real data (what the NN was originally trained on) and observing the profits returned.
+
+### Profits from Real Set
+```{r macd  real data, include=FALSE}
+real_macd_close <- macdTrading(asset, quote(Cl(LLY)))
+```
+
+```{r trading profits real data, echo=FALSE}
+tstats_real_macd <- tradeStats(Portfolios = real_macd_close)
+macd_netpl_real <- round(tstats_real_macd$Net.Trading.PL, 2)
+macd_txns_real <- tstats_test_macd$Num.Txns
+
+print(paste0("Net Profit from MACD (Real): $", macd_netpl_real))
+print(paste0("No. of transactions from MACD (Real): ", macd_txns_real))
+```
+
+As expected, the profits achieved from the MACD strategy using real data reflects the hypothesis that the predicted future data is a better indicator of profitable investments. Granted, the difference in profits is relatively minimal - this is also expected as the NN model was evaluated to be a reasonable predictor. 
+
+## Visualising P and L: Test Data (Cl Prices)
+
+Upon first look, it does appear that this graph looks almost identical to the visualisation of profits using Train Data. However, upon closer inspection, one can notice the slight dip in the Train graph towards the end of December as opposed to the continous incline identified in this graph for Test data.
+
+```{r trading statistics test data, include=FALSE}
+test_macd_close <- macdTrading(asset, quote(test_close_prices))
+```
+
+```{r chart test macd, echo=FALSE}
+chart.Posn(Portfolio=test_macd_close,
+           Symbol=asset,
+           log=TRUE)
+```
+
+# Alternative Approach
+
+## Filter Rule Strategy
+
+To compare against the performance of the original MACD Zero-Cross strategy, a simple filter rule strategy was implemented. The concept of a filter rule is fairly straightforward: send a signal to buy/sell based on the belief that stocks on the rise will continue to increase and stocks on the decline will continue to fall (Mitchell, 2022). 
+
+Moreover, as the MACD was traded with short-term trading fast, slow and signal parameters, this filter rule strategymakes for a good benchmark to compare the MACD against. However, there is no built in function so it was necessary to define a custom function to compare the % change from the previous day:
+
+```{r custom filter}
+ # define custom indicator
+  custom_filter <- function(price) {
+    lagprice <- lag(price,1)
+    temp<-price/lagprice - 1
+    colnames(temp) <- "filter"
+    return(temp)
+  } 
+```
+
+```{r filter rule strategy, include=FALSE}
+filterTrading <- function(asset, prices, threshold) {
+  # initia funds: $10000
+  init_eq=10000
+  init_date=2021-01-01
+  currency('USD')
+  stock(asset, currency='USD', multiplier=1)
+  
+  # reset strategy
+  rm.strat(name = 'filter', silent = TRUE)
+  
+  strategy.st <- 'filter'
+  portfolio.st <- 'filter'
+  account.st <- 'filter'
+  
+  # initial portfolio, initial account and initial orders
+  initPortf(name=portfolio.st, 
+            symbols=asset, 
+            currency='USD')
+  initAcct(name=account.st, 
+           portfolios=portfolio.st,    
+           currency='USD', 
+           initEq=init_eq)
+  initOrders(portfolio=portfolio.st, 
+             symbols=asset)
+  
+  strategy(strategy.st, store=TRUE)
+  
+  # add indicator for filter rule strategy
+  add.indicator(
+    strategy=strategy.st,
+    name = "custom_filter", 
+    arguments = list(price = prices), 
+    label= "filter"
+  )
+  
+  # signal triggers buy when % change is > threshold
+  add.signal(strategy.st, 
+             name="sigThreshold",
+             arguments = list(threshold=threshold,   
+                              column="filter",
+                              relationship="gt",   
+                              cross=TRUE),
+             label="filter.buy")
+  
+  # signal triggers sell when % change is < threshold
+  add.signal(strategy.st, 
+             name="sigThreshold",
+             arguments = list(threshold=-threshold, 
+                              column="filter",
+                              relationship="lt",
+                              cross=TRUE),
+             label="filter.sell") 
+  
+  # rule for entry
+  add.rule(strategy.st, 
+           name='ruleSignal', 
+           arguments = list(sigcol="filter.buy", 
+                            sigval=TRUE,  
+                            orderqty=100,
+                            ordertype='market', 
+                            orderside='long',
+                            pricemethod='market',
+                            replace=FALSE), 
+           type='enter', 
+           path.dep=TRUE)
+  
+  # rule for exit
+  add.rule(strategy.st, 
+           name='ruleSignal', 
+           arguments = list(sigcol="filter.sell",
+                            sigval=TRUE, 
+                            orderqty=-100,  
+                            ordertype='market',  
+                            orderside='long', 
+                            pricemethod='market',  
+                            replace=FALSE), 
+           type='enter', 
+           path.dep=TRUE)
+  
+  out<-try(applyStrategy(strategy=strategy.st,
+                         portfolios=portfolio.st))
+  
+  updatePortf(Portfolio=portfolio.st)
+}
+```
+
+```{r filter rule trading 7% train, include=FALSE}
+train_filter_close_7 <- filterTrading(asset, quote(train_close_prices), 0.07)
+```
+
+```{r filter trading 7% train, include=FALSE}
+tstats_train_filter_7 <- tradeStats(Portfolios = train_filter_close_7)
+filter_7_netpl_train <- round(tstats_train_filter_7$Net.Trading.PL, 2)
+filter_7_txns_train <- tstats_train_filter_7$Num.Txns
+print(paste0("Net Profit from 7% Filter Rule (Train): $", filter_7_netpl_train))
+```
+
+```{r filter rule trading 7% test, include=FALSE}
+test_filter_close_7 <- filterTrading(asset, quote(test_close_prices), 0.07)
+```
+
+```{r filter trading 7% test, include=FALSE}
+tstats_test_filter_7 <- tradeStats(Portfolios = test_filter_close_7)
+filter_7_netpl_test <- round(tstats_test_filter_7$Net.Trading.PL, 2)
+filter_7_txns_test <- tstats_test_filter_7$Num.Txns
+print(paste0("Net Profit from 7% Filter Rule (Test): $", filter_7_netpl_test))
+```
+
+```{r filter rule trading 6% train, include=FALSE}
+train_filter_close_6 <- filterTrading(asset, quote(train_close_prices), 0.06)
+```
+
+```{r filter trading 6% train, include=FALSE}
+tstats_train_filter_6 <- tradeStats(Portfolios = train_filter_close_6)
+filter_6_netpl_train <- round(tstats_train_filter_6$Net.Trading.PL, 2)
+filter_6_txns_train <- tstats_train_filter_6$Num.Txns
+print(paste0("Net Profit from 6% Filter Rule (Train): $", filter_6_netpl_train))
+```
+
+```{r filter rule trading 6% test, include=FALSE}
+test_filter_close_6 <- filterTrading(asset, quote(test_close_prices), 0.06)
+```
+
+```{r filter trading 6% test, include=FALSE}
+tstats_test_filter_6 <- tradeStats(Portfolios = test_filter_close_6)
+filter_6_netpl_test <- round(tstats_test_filter_6$Net.Trading.PL, 2)
+filter_6_txns_test <- tstats_test_filter_6$Num.Txns
+print(paste0("Net Profit from 6% Filter Rule (Test): $", filter_6_netpl_test))
+```
+
+Similar to the original approach, this strategy will utilise the same test-train split and close prices to ensure the comparisons are consistent. This strategy requires one additional parameter which acts as the threshold reflecting the % shifts which signal buy or sell.
+
+In the process of deciding the threshold %, it was noticed that even a 1% change can have significant impacts on the signal generated. The 6% threshold reaps significantly worse profits of \$`r round(filter_6_netpl_test, 2)` vs the 7% which generates \$`r round(filter_7_netpl_test, 2)`. An 8% threshold was too high as there were no price changes above 8% which lead to no trade. Thus, the sweet spot appears to be 7%.
+
+## Comparison
+
+To conclude, the Zero-cross strategy implemented using the MACD indicator and NN has produced some promising results. As shown in the comparison below, the MACD approach using forecasted prices reaped the highest net profit when compared against another short term trading strategy based on filter rules. This holds true for both the test and train sets, but it is especially impressive for the test set which achieved the best overall results. 
+
+
+| Train Set            |    MACD             | Filter (6%)             | Filter (7%)             |
+|:---------------------|--------------------:|------------------------:|------------------------:|
+|   Net Profits ($)    |`r macd_netpl_train` |`r filter_6_netpl_train` |`r filter_7_netpl_train` |
+|   Transactions       |`r macd_txns_train`  |`r filter_6_txns_train`  |`r filter_7_txns_train`  |
+
+
+| Test Set             |    MACD            | Filter (6%)            | Filter (7%)            |
+|:---------------------|-------------------:|-----------------------:|-----------------------:|
+|    Net Profits ($)   |`r macd_netpl_test` |`r filter_6_netpl_test` |`r filter_7_netpl_test` |
+|    Transactions      |`r macd_txns_test`  |`r filter_6_txns_test`  |`r filter_7_txns_test`  |
+
+
+This project may be extended by attempting even more different trading strategies - perhaps one that favour long-term trading to compare how it fares against this study's proposed approach. Moreover, the scope of this project only covered one asset - LLY which was known to have performed well in 2021 and so it may be interesting to see how this strategy would perform trading a stock that did not see growth. Coverage of trading periods may also be a possible avenue to explore as this system performs well in short-term trading scenarios but not necessarily in the long-term.
+
+# References
+
+AvaTrade, 2024. MACD Trading Strategies. Technical Analysis Indicators & Strategies. AvaTrade.
+https://www.avatrade.co.uk/education/technical-analysis-indicators-strategies/macd-trading-strategies
+
+Chaboud, A.P., Chiquoine, B., Hjalmarsson, E. and Vega, C., 2014. Rise of the machines: Algorithmic trading in the foreign exchange market. The Journal of Finance, 69(5), pp.2045-2084.
+
+Dolan, D., 2024. What Is MACD?. The moving average convergence/divergence indicator helps investors identify price trends. Investopedia. 
+https://www.investopedia.com/terms/m/macd.asp
+
+Das, S. and Kadapakkam, P.R., 2020. Machine over mind? Stock price clustering in the era of algorithmic trading. The North American Journal of Economics and Finance, 51, p.100831.
+
+Ermey, R., 2023. Investing in last year’s top 10 stocks is ‘a recipe for disaster,’ expert says. CBNC.
+https://www.cnbc.com/2023/01/14/best-performing-stocks-of-2022.html
+
+Evans, C., Pappas, K. and Xhafa, F., 2013. Utilizing artificial neural networks and genetic algorithms to build an algo-trading model for intra-day foreign exchange speculation. Mathematical and Computer Modelling, 58(5-6), pp.1249-1266.
+
+Fan, W., Zhang, R., He, H., Hou, S. and Tan, Y., 2024. A short-term price prediction-based trading strategy. Plos one, 19(3), p.e0294970.
+
+Mitchell, C., 2022. Filter Rule: Meaning, Parameters, Example. Investopedia
+https://www.investopedia.com/terms/f/filterrule.asp
+
+Pothumsetty, R., 2020. Application of artificial intelligence in algorithmic trading. Int. J. Eng. Appl. Sci. Technol., 4(12), pp.140-149.
+
+Schlossberg, B., 2024. How to Trade the MACD. Investopedia.
+https://www.investopedia.com/articles/forex/05/macddiverge.asp#toc-types-of-macd-strategies
